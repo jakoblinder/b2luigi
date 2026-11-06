@@ -255,6 +255,32 @@ class TestSlurmJobStatus:
         assert status == SlurmJobStatus.configuring
 
 
+class TestSlurmJobStatusMapping(unittest.TestCase):
+    def setUp(self):
+        _batch_job_status_cache.clear()
+
+    def tearDown(self):
+        _batch_job_status_cache.clear()
+
+    def test_only_jobs_that_can_never_run_again_count_as_aborted(self):
+        running = ["REQUEUED", "RESIZING", "SIGNALING", "STAGE_OUT", "STOPPED", "REQUEUE_HOLD", "SPECIAL_EXIT"]
+        for state, expected in [*((state, JobStatus.running) for state in running), ("PREEMPTED", JobStatus.aborted)]:
+            with self.subTest(state=state):
+                _batch_job_status_cache["1"] = SlurmJobStatus(state)
+                self.assertEqual(SlurmProcess._get_job_status_for_id("1"), expected)
+
+    @mock.patch("subprocess.run")
+    @mock.patch("subprocess.check_output")
+    def test_sacct_state_column_is_wide_enough(self, mock_check_output, mock_run):
+        """Without a width, sacct cuts 'OUT_OF_MEMORY' to 'OUT_OF_ME+'."""
+        mock_run.return_value = mock.Mock(returncode=0, stderr=b"")
+        mock_check_output.side_effect = [b"", b"12344 OUT_OF_MEMORY\n"]
+        _batch_job_status_cache._ask_for_job_status(job_id="12344")
+        sacct_command = mock_check_output.call_args_list[1].args[0]
+        self.assertIn("--format=JobID,State%30", sacct_command)
+        self.assertEqual(_batch_job_status_cache["12344"], SlurmJobStatus.out_of_memory)
+
+
 class TestSlurmGroupedSubmission(B2LuigiTestCase):
     """
     Parameter grouping on Slurm: one ``sbatch`` per incomplete scalar sub-task,

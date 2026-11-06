@@ -1,3 +1,4 @@
+import functools
 import math
 import subprocess
 import pathlib
@@ -18,8 +19,11 @@ from b2luigi.batch.processes import (
     write_failed_jobs_log,
 )
 from b2luigi.batch.cache import BatchJobStatusCache
-from b2luigi.core.utils import get_log_file_dir, get_task_file_dir
+from b2luigi.core.utils import get_log_file_dir, get_task_file_dir, get_luigi_logger
 from b2luigi.core.executable import create_executable_wrapper
+
+
+logger = get_luigi_logger()
 
 
 class SlurmJobStatusCache(BatchJobStatusCache):
@@ -79,7 +83,8 @@ class SlurmJobStatusCache(BatchJobStatusCache):
                 "-X",
                 "--user",
                 user,
-                "--format=JobID,State",
+                # Without a width, sacct cuts the state to 10 characters, e.g. 'OUT_OF_ME+'.
+                "--format=JobID,State%30",
                 "--job",
                 str(job_id),
             ]
@@ -241,13 +246,23 @@ class SlurmJobStatus(StrEnum):
         running (str): The job is currently running.
         configuring (str): The job is allocated resources but waiting for nodes to be prepared.
         suspended (str): The job has been suspended.
-        preempted (str): The job has been preempted by another job.
         completing (str): The job is in the process of completing.
+        requeued (str): The job is being put back into the queue and runs again under the same id.
+        resizing (str): The job is about to change its size.
+        signaling (str): The job is being sent a signal.
+        stage_out (str): The job is staging out files after it ran.
+        stopped (str): The job was stopped with SIGSTOP and keeps its allocation.
+
+        requeue_hold (str): The job is being requeued and held.
+        special_exit (str): The job was requeued into a special held state.
+        resv_del_hold (str): The job is held because its reservation was deleted.
 
         boot_fail (str): The job failed during the boot process.
         cancelled (str): The job was cancelled by the user or system.
         deadline (str): The job missed its deadline.
         node_fail (str): The job failed due to a node failure.
+        preempted (str): The job was ended by preemption. A preempted job that Slurm requeues or
+            suspends is reported as requeued or suspended instead.
         out_of_memory (str): The job ran out of memory.
         failed (str): The job failed for an unspecified reason.
         timeout (str): The job exceeded its time limit.
@@ -260,21 +275,38 @@ class SlurmJobStatus(StrEnum):
     pending = "PENDING"
     running = "RUNNING"
     suspended = "SUSPENDED"
-    preempted = "PREEMPTED"
     completing = "COMPLETING"
     configuring = "CONFIGURING"
+    requeued = "REQUEUED"
+    resizing = "RESIZING"
+    signaling = "SIGNALING"
+    stage_out = "STAGE_OUT"
+    stopped = "STOPPED"
+
+    # held, i.e. running until someone releases or cancels them:
+    requeue_hold = "REQUEUE_HOLD"
+    special_exit = "SPECIAL_EXIT"
+    resv_del_hold = "RESV_DEL_HOLD"
 
     # failed:
     boot_fail = "BOOT_FAIL"
     cancelled = "CANCELLED"
     deadline = "DEADLINE"
     node_fail = "NODE_FAIL"
+    preempted = "PREEMPTED"
     out_of_memory = "OUT_OF_MEMORY"
     failed = "FAILED"
     timeout = "TIMEOUT"
 
 
 _batch_job_status_cache = SlurmJobStatusCache()
+
+
+@functools.cache
+def _warn_once(message: str) -> None:
+    """Log ``message`` only once, not on every status poll."""
+    logger.warning(message)
+
 
 #: Allowed values of the ``submission_type`` setting, see :obj:`SlurmProcess`.
 SUBMISSION_TYPES = ("single", "array", "mpi")
@@ -382,9 +414,13 @@ class SlurmProcess(BatchProcess):
         Returns:
             JobStatus: The status of the job, which can be one of the following:
                 - :meth:`JobStatus.successful <b2luigi.process.JobStatus.successful>`: If the job has completed successfully.
-                - :meth:`JobStatus.running <b2luigi.process.JobStatus.running>`: If the job is currently running, pending, suspended, preempted, or completing.
+                - :meth:`JobStatus.running <b2luigi.process.JobStatus.running>`: If the job is currently running, pending, suspended, held, or completing.
                 - :meth:`JobStatus.aborted <b2luigi.process.JobStatus.aborted>`: If the job has failed, been cancelled, exceeded its deadline, encountered a node failure,
-                  ran out of memory, timed out, or if the job ID is not found.
+                  been preempted, ran out of memory, timed out, or if the job ID is not found.
+
+            A job counts as aborted only if it can never run again. Otherwise the task could be
+            resubmitted while the old job still runs, or is released from a hold later, and both
+            would run at the same time. A held job therefore counts as running, with a warning.
 
         Raises:
             ValueError: If the Slurm job status is unknown or not handled.
@@ -401,16 +437,30 @@ class SlurmProcess(BatchProcess):
             SlurmJobStatus.pending,
             SlurmJobStatus.running,
             SlurmJobStatus.suspended,
-            SlurmJobStatus.preempted,
             SlurmJobStatus.completing,
             SlurmJobStatus.configuring,
+            SlurmJobStatus.requeued,
+            SlurmJobStatus.resizing,
+            SlurmJobStatus.signaling,
+            SlurmJobStatus.stage_out,
+            SlurmJobStatus.stopped,
         ]:
+            return JobStatus.running
+        if job_status in [
+            SlurmJobStatus.requeue_hold,
+            SlurmJobStatus.special_exit,
+            SlurmJobStatus.resv_del_hold,
+        ]:
+            _warn_once(
+                f"Slurm job {job_id} is held ({job_status}). It counts as running until it is released or cancelled."
+            )
             return JobStatus.running
         if job_status in [
             SlurmJobStatus.boot_fail,
             SlurmJobStatus.cancelled,
             SlurmJobStatus.deadline,
             SlurmJobStatus.node_fail,
+            SlurmJobStatus.preempted,
             SlurmJobStatus.out_of_memory,
             SlurmJobStatus.failed,
             SlurmJobStatus.timeout,
