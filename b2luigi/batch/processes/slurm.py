@@ -5,6 +5,7 @@ import pathlib
 import re
 import getpass
 import stat
+import time
 from enum import StrEnum
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
@@ -308,6 +309,81 @@ def _warn_once(message: str) -> None:
     logger.warning(message)
 
 
+#: Slurm lost these jobs, whatever their payload did, so they may be resubmitted.
+LOST_JOB_STATES = (SlurmJobStatus.node_fail, SlurmJobStatus.boot_fail, SlurmJobStatus.preempted)
+
+
+class SlurmJobState:
+    """
+    What b2luigi knows about one Slurm job of a ``"single"`` or ``"array"`` submission: its
+    :obj:`JobStatus`, and since when Slurm has reported its current state. A job that hangs in
+    COMPLETING or that Slurm lost is not left to Slurm: it counts as successful if its task is
+    complete, and otherwise it is resubmitted (or fails once it has used up its resubmissions).
+
+    Attributes:
+        sub_task (luigi.Task): The single task that the job runs. Its ``complete()`` decides whether
+            a job that hangs in COMPLETING or that Slurm lost has still produced its outputs.
+        resubmissions (int): How often ``sub_task`` was resubmitted before this job. A resubmission
+            gets a new job ID and a new ``SlurmJobState`` with this count plus one, so that
+            ``slurm_max_resubmissions`` limits the resubmissions per task, not per job.
+        status (JobStatus): What :obj:`SlurmProcess.get_job_status` reports for this job: ``running``,
+            ``successful`` or ``aborted``. Never any other member. ``successful`` and ``aborted`` are
+            final: :meth:`update` then changes nothing.
+        wants_resubmission (bool): ``True`` once the job has hung in COMPLETING for
+            ``slurm_completing_grace`` seconds, or was lost, without its task's outputs, and
+            resubmissions are left. :obj:`SlurmProcess` then replaces the job with a new one.
+            ``status`` stays ``running``.
+        _slurm_status (str | None): The Slurm state (:obj:`SlurmJobStatus`) seen by the last
+            :meth:`update`, ``None`` before the first one.
+        _since (float): When ``_slurm_status`` was first seen, as returned by ``time.time()``, so that
+            ``time.time() - _since`` is the time in seconds the job has been in that state. It is
+            measured from b2luigi's status polls, so it starts again when b2luigi restarts, and it can
+            be up to one ``batch_status_cache_ttl`` later than the actual change of state.
+    """
+
+    def __init__(self, sub_task: luigi.Task, resubmissions: int = 0):
+        self.sub_task = sub_task
+        self.resubmissions = resubmissions
+        self.status = JobStatus.running
+        self.wants_resubmission = False
+        self._slurm_status = None
+        self._since = time.time()
+
+    def update(self, slurm_status: str | None, status: JobStatus):
+        """
+        Update ``status`` from the job's current Slurm state.
+
+        Args:
+            slurm_status: The job's current Slurm state (:obj:`SlurmJobStatus`), or ``None`` if Slurm
+                does not know the job.
+            status: The plain translation of ``slurm_status`` by
+                :meth:`SlurmProcess._get_job_status_for_id`, which knows nothing about the job's
+                history, e.g. ``running`` for COMPLETING and ``aborted`` for NODE_FAIL. It becomes
+                ``self.status``, unless the job is in COMPLETING or was lost: then this method decides.
+        """
+        if slurm_status != self._slurm_status:
+            self._slurm_status, self._since = slurm_status, time.time()
+        grace = get_setting("slurm_completing_grace", task=self.sub_task, default=900)
+
+        if self.status != JobStatus.running:
+            pass  # successful and aborted are final
+        elif slurm_status != SlurmJobStatus.completing and slurm_status not in LOST_JOB_STATES:
+            self.status = status
+        elif self.sub_task.complete():
+            self.status = JobStatus.successful
+        elif slurm_status in LOST_JOB_STATES or time.time() - self._since >= grace:
+            if self.resubmissions < get_setting("slurm_max_resubmissions", task=self.sub_task, default=0):
+                self.wants_resubmission = True
+            else:
+                logger.warning(
+                    f"The Slurm job of {self.sub_task} is {slurm_status} without the task's outputs, "
+                    "and the task has no resubmissions left."
+                )
+                self.status = JobStatus.aborted
+        else:
+            pass  # in COMPLETING for less than the grace: keep waiting
+
+
 #: Allowed values of the ``submission_type`` setting, see :obj:`SlurmProcess`.
 SUBMISSION_TYPES = ("single", "array", "mpi")
 
@@ -348,6 +424,16 @@ class SlurmProcess(BatchProcess):
       In all three cases every sub-task writes its ``stdout``/``stderr`` into its own log directory,
       and the task is only reported successful once every sub-task has finished successfully.
 
+    * Jobs of a ``"single"`` or ``"array"`` submission that hang in COMPLETING or that Slurm lost
+      do not block or fail the task (see :obj:`SlurmJobState`):
+
+      - A job in COMPLETING or lost whose task is complete counts as successful.
+      - A job in COMPLETING for ``slurm_completing_grace`` seconds (default 900) without the task's
+        outputs, or lost to a node failure, a boot failure or preemption, is resubmitted, at most
+        ``slurm_max_resubmissions`` times per task (default 0, i.e. it fails).
+      - A job that failed for any other reason is never resubmitted, so that a deterministic failure
+        is not run again and again.
+
     * Same as for the :ref:`lsf` and :ref:`htcondor`, the ``job_name`` setting allows giving a meaningful
       name to a group of jobs. If you want to be task-instance-specific, you can provide the ``job-name``
       as an entry in the ``slurm_settings`` dict, which will override the global ``job_name`` setting.
@@ -375,6 +461,8 @@ class SlurmProcess(BatchProcess):
         self._job_log_dirs: dict[str, str] = {}
         # For submission_type "mpi": the log directories of all sub-tasks run by one job.
         self._job_sub_task_log_dirs: dict[str, list[str]] = {}
+        # For submission_type "single" and "array": the state of every job, keyed by job id.
+        self._job_states: dict[str, SlurmJobState] = {}
 
     def get_job_status(self) -> JobStatus:
         """
@@ -390,7 +478,8 @@ class SlurmProcess(BatchProcess):
             JobStatus: The aggregated status, or :meth:`JobStatus.aborted <b2luigi.process.JobStatus.aborted>`
             if no job was submitted.
         """
-        job_statuses = {job_id: self._get_job_status_for_id(job_id) for job_id in self._batch_job_ids}
+        # A copy, because a resubmission replaces a job id in self._batch_job_ids.
+        job_statuses = {job_id: self._get_status_of_job(job_id) for job_id in list(self._batch_job_ids)}
         status = aggregate_job_status(job_statuses.values())
         if status == JobStatus.aborted:
             failed_jobs = {}
@@ -405,6 +494,32 @@ class SlurmProcess(BatchProcess):
                     failed_jobs[job_id] = self._job_log_dirs.get(job_id, "")
             write_failed_jobs_log(self.task, failed_jobs)
         return status
+
+    def _get_status_of_job(self, job_id: str) -> JobStatus:
+        """Status of one job. A job of a ``"single"`` or ``"array"`` submission goes through its :obj:`SlurmJobState`."""
+        status = self._get_job_status_for_id(job_id)
+        state = self._job_states.get(job_id)
+        if state is None:
+            return status
+        else:
+            slurm_status = _batch_job_status_cache.get(job_id)
+            state.update(slurm_status, status)
+            if state.wants_resubmission:
+                self._resubmit(job_id, state, slurm_status)
+            return state.status
+
+    def _resubmit(self, job_id: str, state: SlurmJobState, slurm_status: str):
+        """Replace the job by a new ``"single"`` job of its task."""
+        new_job_id = self._submit(self._create_slurm_submit_file(state.sub_task))
+        logger.warning(
+            f"Slurm job {job_id} is {slurm_status} without the outputs of {state.sub_task}. "
+            f"The task is resubmitted as job {new_job_id} (resubmission {state.resubmissions + 1})."
+        )
+        self._batch_job_ids[self._batch_job_ids.index(job_id)] = new_job_id
+        self._job_log_dirs[new_job_id] = self._job_log_dirs.pop(job_id, get_log_file_dir(state.sub_task))
+        self._job_states[new_job_id] = SlurmJobState(state.sub_task, state.resubmissions + 1)
+        del self._job_states[job_id]
+        _batch_job_status_cache.seed_submitted([new_job_id], SlurmJobStatus.pending)
 
     @staticmethod
     def _get_job_status_for_id(job_id: str) -> JobStatus:
@@ -514,6 +629,7 @@ class SlurmProcess(BatchProcess):
                 # Avoid a full squeue for the first status check of every new job
                 _batch_job_status_cache.seed_submitted([job_id], SlurmJobStatus.pending)
                 self._job_log_dirs[job_id] = get_log_file_dir(sub_task)
+                self._job_states[job_id] = SlurmJobState(sub_task)
             return
 
         # The whole group is submitted as one Slurm job.
@@ -523,6 +639,7 @@ class SlurmProcess(BatchProcess):
                 element_id = f"{job_id}_{index}"
                 self._batch_job_ids.append(element_id)
                 self._job_log_dirs[element_id] = get_log_file_dir(sub_task)
+                self._job_states[element_id] = SlurmJobState(sub_task)
         else:
             self._batch_job_ids.append(job_id)
             self._job_sub_task_log_dirs[job_id] = [get_log_file_dir(sub_task) for sub_task in sub_tasks]

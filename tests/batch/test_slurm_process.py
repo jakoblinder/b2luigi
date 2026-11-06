@@ -6,6 +6,7 @@ import os
 import pathlib
 
 import subprocess
+import time
 import unittest
 from unittest import mock
 
@@ -638,3 +639,83 @@ class TestSlurmArrayAndMpiSubmission(B2LuigiTestCase):
 
         run.assert_called_once()
         self.assertEqual(run.call_args.args[0], ["scancel", "101", "102"])
+
+
+class FakeSlurm:
+    """Answers ``sbatch`` like a small Slurm cluster, with job ids counting up from 101."""
+
+    def __init__(self):
+        self.last_job_id = 100
+        self.sbatch_cwds = []
+
+    def check_output(self, command, **kwargs):
+        if command[0] == "sbatch":
+            self.last_job_id += 1
+            self.sbatch_cwds.append(str(kwargs["cwd"]))
+            return f"Submitted batch job {self.last_job_id}".encode()
+        raise AssertionError(f"Unexpected command {command}")
+
+
+class TestSlurmStuckAndLostJobs(B2LuigiTestCase):
+    """Jobs of an array submission that hang in COMPLETING or that Slurm lost are resubmitted or given up on."""
+
+    def setUp(self):
+        super().setUp()
+        _batch_job_status_cache.clear()
+        b2luigi.set_setting("log_dir", os.path.join(self.test_dir, "logs"))
+        b2luigi.set_setting("task_file_dir", os.path.join(self.test_dir, "task_files"))
+        b2luigi.set_setting("submission_type", "array")
+        self.slurm = FakeSlurm()
+        check_output = mock.patch("subprocess.check_output", side_effect=self.slurm.check_output)
+        check_output.start()
+        self.addCleanup(check_output.stop)
+
+    def tearDown(self):
+        for setting in ("log_dir", "task_file_dir", "submission_type", "slurm_max_resubmissions"):
+            b2luigi.clear_setting(setting)
+        _batch_job_status_cache.clear()
+        super().tearDown()
+
+    def _start(self):
+        """Submit an array of two elements, 101_0 and 101_1, the second of which completes normally."""
+        self.task = MyGroupedTask(plain=0, grouped=(0, 1))
+        process = TestSlurmGroupedSubmission._make_process(self.task)
+        process.start_job()
+        self.assertEqual(process._batch_job_ids, ["101_0", "101_1"])
+        _batch_job_status_cache["101_1"] = SlurmJobStatus.completed
+        return process
+
+    def test_completing_job_without_outputs_is_resubmitted_after_the_grace(self):
+        b2luigi.set_setting("slurm_max_resubmissions", 1)
+        process = self._start()
+        _batch_job_status_cache["101_0"] = SlurmJobStatus.completing
+
+        self.assertEqual(process.get_job_status(), JobStatus.running)
+        self.assertEqual(len(self.slurm.sbatch_cwds), 1)
+
+        now = time.time()
+        with mock.patch("time.time", return_value=now + 901):
+            self.assertEqual(process.get_job_status(), JobStatus.running)
+        self.assertEqual(process._batch_job_ids, ["102", "101_1"])
+        self.assertIn("grouped=0", self.slurm.sbatch_cwds[1])
+
+        _batch_job_status_cache["102"] = SlurmJobStatus.completing
+        with mock.patch("time.time", return_value=now + 901):
+            self.assertEqual(process.get_job_status(), JobStatus.running)
+        with mock.patch("time.time", return_value=now + 1802):
+            self.assertEqual(process.get_job_status(), JobStatus.aborted)
+        self.assertEqual(len(self.slurm.sbatch_cwds), 2)
+
+    def test_lost_job_is_resubmitted_up_to_the_limit(self):
+        b2luigi.set_setting("slurm_max_resubmissions", 1)
+        process = self._start()
+        _batch_job_status_cache["101_0"] = SlurmJobStatus.node_fail
+
+        self.assertEqual(process.get_job_status(), JobStatus.running)
+        self.assertEqual(process._batch_job_ids, ["102", "101_1"])
+        self.assertIn("grouped=0", self.slurm.sbatch_cwds[1])
+        self.assertEqual(process._job_log_dirs["102"], get_log_file_dir(self.task.clone(None, grouped=0)))
+
+        _batch_job_status_cache["102"] = SlurmJobStatus.boot_fail
+        self.assertEqual(process.get_job_status(), JobStatus.aborted)
+        self.assertEqual(len(self.slurm.sbatch_cwds), 2)

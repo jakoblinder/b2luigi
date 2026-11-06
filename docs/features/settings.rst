@@ -210,6 +210,16 @@ Slurm specific settings
     Only used when ``submission_type`` is ``"mpi"``. The number of sub-tasks that may be packed
     onto a single node; used to compute how many nodes to request. Defaults to ``64``.
 
+- ``slurm_max_resubmissions``: Int
+    How often a task is resubmitted after Slurm lost its job (node failure, boot failure,
+    preemption), or after its job was stuck in COMPLETING (see ``slurm_completing_grace``). A job
+    that failed for any other reason is never resubmitted. Defaults to ``0``. See
+    :class:`SlurmProcess <b2luigi.batch.processes.slurm.SlurmProcess>`.
+
+- ``slurm_completing_grace``: Int
+    Seconds a job may stay in COMPLETING without the task's outputs before it is resubmitted, or
+    counts as failed if no resubmissions are left. Defaults to ``900``.
+
 
 ``gbasf2`` specific settings
 ++++++++++++++++++++++++++++
