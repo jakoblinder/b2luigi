@@ -212,13 +212,19 @@ Slurm specific settings
 
 - ``slurm_max_resubmissions``: Int
     How often a task is resubmitted after Slurm lost its job (node failure, boot failure,
-    preemption), or after its job was stuck in COMPLETING (see ``slurm_completing_grace``). A job
+    preemption), after its job was stuck in COMPLETING (see ``slurm_completing_grace``), or after
+    its ``batch_job_is_hung()`` reported the job as hung (see ``slurm_hung_check_after``). A job
     that failed for any other reason is never resubmitted. Defaults to ``0``. See
     :class:`SlurmProcess <b2luigi.batch.processes.slurm.SlurmProcess>`.
 
 - ``slurm_completing_grace``: Int
     Seconds a job may stay in COMPLETING without the task's outputs before it is resubmitted, or
     counts as failed if no resubmissions are left. Defaults to ``900``.
+
+- ``slurm_hung_check_after``: Int
+    Seconds after b2luigi first saw a job RUNNING at which it asks the task's ``batch_job_is_hung()``,
+    once. A hung job is cancelled and resubmitted (see ``slurm_max_resubmissions``). Defaults to
+    ``0``, i.e. never.
 
 
 ``gbasf2`` specific settings

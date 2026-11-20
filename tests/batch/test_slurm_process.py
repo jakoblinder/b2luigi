@@ -656,6 +656,13 @@ class FakeSlurm:
         raise AssertionError(f"Unexpected command {command}")
 
 
+class HangingGroupedTask(MyGroupedTask):
+    """Grouped task whose running job always reports itself as hung."""
+
+    def batch_job_is_hung(self):
+        return True
+
+
 class TestSlurmStuckAndLostJobs(B2LuigiTestCase):
     """Jobs of an array submission that hang in COMPLETING or that Slurm lost are resubmitted or given up on."""
 
@@ -671,14 +678,20 @@ class TestSlurmStuckAndLostJobs(B2LuigiTestCase):
         self.addCleanup(check_output.stop)
 
     def tearDown(self):
-        for setting in ("log_dir", "task_file_dir", "submission_type", "slurm_max_resubmissions"):
+        for setting in (
+            "log_dir",
+            "task_file_dir",
+            "submission_type",
+            "slurm_max_resubmissions",
+            "slurm_hung_check_after",
+        ):
             b2luigi.clear_setting(setting)
         _batch_job_status_cache.clear()
         super().tearDown()
 
-    def _start(self):
+    def _start(self, task_class=MyGroupedTask):
         """Submit an array of two elements, 101_0 and 101_1, the second of which completes normally."""
-        self.task = MyGroupedTask(plain=0, grouped=(0, 1))
+        self.task = task_class(plain=0, grouped=(0, 1))
         process = TestSlurmGroupedSubmission._make_process(self.task)
         process.start_job()
         self.assertEqual(process._batch_job_ids, ["101_0", "101_1"])
@@ -719,3 +732,18 @@ class TestSlurmStuckAndLostJobs(B2LuigiTestCase):
         _batch_job_status_cache["102"] = SlurmJobStatus.boot_fail
         self.assertEqual(process.get_job_status(), JobStatus.aborted)
         self.assertEqual(len(self.slurm.sbatch_cwds), 2)
+
+    @mock.patch("subprocess.run")
+    def test_hung_job_is_cancelled_and_resubmitted(self, run):
+        b2luigi.set_setting("slurm_hung_check_after", 600)
+        b2luigi.set_setting("slurm_max_resubmissions", 1)
+        process = self._start(HangingGroupedTask)
+        _batch_job_status_cache["101_0"] = SlurmJobStatus.running
+
+        self.assertEqual(process.get_job_status(), JobStatus.running)
+        run.assert_not_called()
+
+        with mock.patch("time.time", return_value=time.time() + 601):
+            self.assertEqual(process.get_job_status(), JobStatus.running)
+        self.assertEqual(run.call_args.args[0], ["scancel", "101_0"])
+        self.assertEqual(process._batch_job_ids, ["102", "101_1"])

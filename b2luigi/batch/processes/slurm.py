@@ -319,6 +319,8 @@ class SlurmJobState:
     :obj:`JobStatus`, and since when Slurm has reported its current state. A job that hangs in
     COMPLETING or that Slurm lost is not left to Slurm: it counts as successful if its task is
     complete, and otherwise it is resubmitted (or fails once it has used up its resubmissions).
+    A job that hangs in RUNNING (its task's ``batch_job_is_hung()`` says so) is cancelled and
+    resubmitted the same way.
 
     Attributes:
         sub_task (luigi.Task): The single task that the job runs. Its ``complete()`` decides whether
@@ -330,15 +332,20 @@ class SlurmJobState:
             ``successful`` or ``aborted``. Never any other member. ``successful`` and ``aborted`` are
             final: :meth:`update` then changes nothing.
         wants_resubmission (bool): ``True`` once the job has hung in COMPLETING for
-            ``slurm_completing_grace`` seconds, or was lost, without its task's outputs, and
-            resubmissions are left. :obj:`SlurmProcess` then replaces the job with a new one.
+            ``slurm_completing_grace`` seconds, or was lost, without its task's outputs, or hangs in
+            RUNNING, and resubmissions are left. :obj:`SlurmProcess` then replaces the job with a new one.
             ``status`` stays ``running``.
+        wants_cancel (bool): ``True`` once the job was found hung in RUNNING. :obj:`SlurmProcess`
+            then cancels it and resets the flag.
         _slurm_status (str | None): The Slurm state (:obj:`SlurmJobStatus`) seen by the last
             :meth:`update`, ``None`` before the first one.
         _since (float): When ``_slurm_status`` was first seen, as returned by ``time.time()``, so that
             ``time.time() - _since`` is the time in seconds the job has been in that state. It is
             measured from b2luigi's status polls, so it starts again when b2luigi restarts, and it can
             be up to one ``batch_status_cache_ttl`` later than the actual change of state.
+        _hung_checked (bool): Whether the task's ``batch_job_is_hung()`` was asked. It is asked only
+            once per job, ``slurm_hung_check_after`` seconds into RUNNING, because luigi polls the
+            job status about once a second.
     """
 
     def __init__(self, sub_task: luigi.Task, resubmissions: int = 0):
@@ -346,8 +353,10 @@ class SlurmJobState:
         self.resubmissions = resubmissions
         self.status = JobStatus.running
         self.wants_resubmission = False
+        self.wants_cancel = False
         self._slurm_status = None
         self._since = time.time()
+        self._hung_checked = False
 
     def update(self, slurm_status: str | None, status: JobStatus):
         """
@@ -359,29 +368,48 @@ class SlurmJobState:
             status: The plain translation of ``slurm_status`` by
                 :meth:`SlurmProcess._get_job_status_for_id`, which knows nothing about the job's
                 history, e.g. ``running`` for COMPLETING and ``aborted`` for NODE_FAIL. It becomes
-                ``self.status``, unless the job is in COMPLETING or was lost: then this method decides.
+                ``self.status``, unless the job is in COMPLETING, was lost, or is RUNNING and due for
+                the hung check: then this method decides.
         """
         if slurm_status != self._slurm_status:
             self._slurm_status, self._since = slurm_status, time.time()
         grace = get_setting("slurm_completing_grace", task=self.sub_task, default=900)
+        hung_check_after = get_setting("slurm_hung_check_after", task=self.sub_task, default=0)
+        hung_check_due = (
+            slurm_status == SlurmJobStatus.running
+            and hung_check_after > 0
+            and hasattr(self.sub_task, "batch_job_is_hung")  # a task without the method is never asked
+            and not self._hung_checked
+            and time.time() - self._since >= hung_check_after
+        )
 
         if self.status != JobStatus.running:
             pass  # successful and aborted are final
+        elif hung_check_due:
+            self._hung_checked = True
+            if self.sub_task.batch_job_is_hung():
+                logger.warning(f"The Slurm job of {self.sub_task} hangs: it is cancelled.")
+                self.wants_cancel = True
+                self._resubmit_or_give_up(slurm_status)
         elif slurm_status != SlurmJobStatus.completing and slurm_status not in LOST_JOB_STATES:
             self.status = status
         elif self.sub_task.complete():
             self.status = JobStatus.successful
         elif slurm_status in LOST_JOB_STATES or time.time() - self._since >= grace:
-            if self.resubmissions < get_setting("slurm_max_resubmissions", task=self.sub_task, default=0):
-                self.wants_resubmission = True
-            else:
-                logger.warning(
-                    f"The Slurm job of {self.sub_task} is {slurm_status} without the task's outputs, "
-                    "and the task has no resubmissions left."
-                )
-                self.status = JobStatus.aborted
+            self._resubmit_or_give_up(slurm_status)
         else:
             pass  # in COMPLETING for less than the grace: keep waiting
+
+    def _resubmit_or_give_up(self, slurm_status: str | None):
+        """Ask for a resubmission if the task has resubmissions left, otherwise fail the job."""
+        if self.resubmissions < get_setting("slurm_max_resubmissions", task=self.sub_task, default=0):
+            self.wants_resubmission = True
+        else:
+            logger.warning(
+                f"The Slurm job of {self.sub_task} is {slurm_status} without the task's outputs, "
+                "and the task has no resubmissions left."
+            )
+            self.status = JobStatus.aborted
 
 
 #: Allowed values of the ``submission_type`` setting, see :obj:`SlurmProcess`.
@@ -431,6 +459,9 @@ class SlurmProcess(BatchProcess):
       - A job in COMPLETING for ``slurm_completing_grace`` seconds (default 900) without the task's
         outputs, or lost to a node failure, a boot failure or preemption, is resubmitted, at most
         ``slurm_max_resubmissions`` times per task (default 0, i.e. it fails).
+      - A task can define ``batch_job_is_hung()``. b2luigi asks it once, ``slurm_hung_check_after``
+        seconds after it first saw the job RUNNING (default 0, i.e. never), and cancels and resubmits a hung
+        job under the same limit. A task without the method is never asked.
       - A job that failed for any other reason is never resubmitted, so that a deterministic failure
         is not run again and again.
 
@@ -504,6 +535,9 @@ class SlurmProcess(BatchProcess):
         else:
             slurm_status = _batch_job_status_cache.get(job_id)
             state.update(slurm_status, status)
+            if state.wants_cancel:
+                subprocess.run(["scancel", job_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                state.wants_cancel = False
             if state.wants_resubmission:
                 self._resubmit(job_id, state, slurm_status)
             return state.status
