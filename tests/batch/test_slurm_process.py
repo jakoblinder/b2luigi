@@ -20,6 +20,7 @@ from b2luigi.batch.processes.slurm import (
     SlurmProcess,
     SlurmJobStatus,
     _batch_job_status_cache,
+    _nodes_of_job,
 )
 
 from ..helpers import B2LuigiTestCase
@@ -653,6 +654,8 @@ class FakeSlurm:
             self.last_job_id += 1
             self.sbatch_cwds.append(str(kwargs["cwd"]))
             return f"Submitted batch job {self.last_job_id}".encode()
+        if command[0] == "sacct":
+            return b"   node12 \n"
         raise AssertionError(f"Unexpected command {command}")
 
 
@@ -724,14 +727,23 @@ class TestSlurmStuckAndLostJobs(B2LuigiTestCase):
         process = self._start()
         _batch_job_status_cache["101_0"] = SlurmJobStatus.node_fail
 
-        self.assertEqual(process.get_job_status(), JobStatus.running)
+        with self.assertLogs(level="WARNING") as logs:
+            self.assertEqual(process.get_job_status(), JobStatus.running)
+        self.assertIn("Slurm job 101_0 on node(s) node12 is NODE_FAIL", logs.output[0])
         self.assertEqual(process._batch_job_ids, ["102", "101_1"])
         self.assertIn("grouped=0", self.slurm.sbatch_cwds[1])
         self.assertEqual(process._job_log_dirs["102"], get_log_file_dir(self.task.clone(None, grouped=0)))
 
         _batch_job_status_cache["102"] = SlurmJobStatus.boot_fail
-        self.assertEqual(process.get_job_status(), JobStatus.aborted)
+        with self.assertLogs(level="WARNING") as logs:
+            self.assertEqual(process.get_job_status(), JobStatus.aborted)
+        self.assertIn("Slurm job 102 of", logs.output[0])
+        self.assertIn("on node(s) node12 is BOOT_FAIL", logs.output[0])
         self.assertEqual(len(self.slurm.sbatch_cwds), 2)
+
+    def test_node_is_unknown_when_sacct_fails(self):
+        with mock.patch("subprocess.check_output", side_effect=subprocess.CalledProcessError(1, "sacct")):
+            self.assertEqual(_nodes_of_job("101_0"), "unknown")
 
     @mock.patch("subprocess.run")
     def test_hung_job_is_cancelled_and_resubmitted(self, run):

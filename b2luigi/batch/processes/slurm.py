@@ -309,6 +309,20 @@ def _warn_once(message: str) -> None:
     logger.warning(message)
 
 
+def _nodes_of_job(job_id: str) -> str:
+    """
+    The nodes that a Slurm job ran on, as ``sacct`` reports them, e.g. ``node12`` or ``node[12-13]``,
+    so that the user can pass them to ``--exclude``. Asked only once b2luigi has given up on the job,
+    never on a status poll, to keep the load on the Slurm controller low.
+    """
+    history_cmd = ["sacct", "--noheader", "-X", "--user", getpass.getuser(), "--job", job_id, "--format=NodeList%1000"]
+    try:
+        output = subprocess.check_output(history_cmd).decode()
+    except subprocess.CalledProcessError:
+        return "unknown"
+    return output.strip() or "unknown"
+
+
 #: Slurm lost these jobs, whatever their payload did, so they may be resubmitted.
 LOST_JOB_STATES = (SlurmJobStatus.node_fail, SlurmJobStatus.boot_fail, SlurmJobStatus.preempted)
 
@@ -323,6 +337,8 @@ class SlurmJobState:
     resubmitted the same way.
 
     Attributes:
+        job_id (str): The Slurm job ID, ``<job id>_<index>`` for an array element. Only used to name
+            the job's nodes when b2luigi gives up on it.
         sub_task (luigi.Task): The single task that the job runs. Its ``complete()`` decides whether
             a job that hangs in COMPLETING or that Slurm lost has still produced its outputs.
         resubmissions (int): How often ``sub_task`` was resubmitted before this job. A resubmission
@@ -348,7 +364,8 @@ class SlurmJobState:
             job status about once a second.
     """
 
-    def __init__(self, sub_task: luigi.Task, resubmissions: int = 0):
+    def __init__(self, job_id: str, sub_task: luigi.Task, resubmissions: int = 0):
+        self.job_id = job_id
         self.sub_task = sub_task
         self.resubmissions = resubmissions
         self.status = JobStatus.running
@@ -406,8 +423,8 @@ class SlurmJobState:
             self.wants_resubmission = True
         else:
             logger.warning(
-                f"The Slurm job of {self.sub_task} is {slurm_status} without the task's outputs, "
-                "and the task has no resubmissions left."
+                f"Slurm job {self.job_id} of {self.sub_task} on node(s) {_nodes_of_job(self.job_id)} is {slurm_status} "
+                "without the task's outputs, and the task has no resubmissions left."
             )
             self.status = JobStatus.aborted
 
@@ -546,12 +563,12 @@ class SlurmProcess(BatchProcess):
         """Replace the job by a new ``"single"`` job of its task."""
         new_job_id = self._submit(self._create_slurm_submit_file(state.sub_task))
         logger.warning(
-            f"Slurm job {job_id} is {slurm_status} without the outputs of {state.sub_task}. "
-            f"The task is resubmitted as job {new_job_id} (resubmission {state.resubmissions + 1})."
+            f"Slurm job {job_id} on node(s) {_nodes_of_job(job_id)} is {slurm_status} without the outputs of "
+            f"{state.sub_task}. The task is resubmitted as job {new_job_id} (resubmission {state.resubmissions + 1})."
         )
         self._batch_job_ids[self._batch_job_ids.index(job_id)] = new_job_id
         self._job_log_dirs[new_job_id] = self._job_log_dirs.pop(job_id, get_log_file_dir(state.sub_task))
-        self._job_states[new_job_id] = SlurmJobState(state.sub_task, state.resubmissions + 1)
+        self._job_states[new_job_id] = SlurmJobState(new_job_id, state.sub_task, state.resubmissions + 1)
         del self._job_states[job_id]
         _batch_job_status_cache.seed_submitted([new_job_id], SlurmJobStatus.pending)
 
@@ -663,7 +680,7 @@ class SlurmProcess(BatchProcess):
                 # Avoid a full squeue for the first status check of every new job
                 _batch_job_status_cache.seed_submitted([job_id], SlurmJobStatus.pending)
                 self._job_log_dirs[job_id] = get_log_file_dir(sub_task)
-                self._job_states[job_id] = SlurmJobState(sub_task)
+                self._job_states[job_id] = SlurmJobState(job_id, sub_task)
             return
 
         # The whole group is submitted as one Slurm job.
@@ -673,7 +690,7 @@ class SlurmProcess(BatchProcess):
                 element_id = f"{job_id}_{index}"
                 self._batch_job_ids.append(element_id)
                 self._job_log_dirs[element_id] = get_log_file_dir(sub_task)
-                self._job_states[element_id] = SlurmJobState(sub_task)
+                self._job_states[element_id] = SlurmJobState(element_id, sub_task)
         else:
             self._batch_job_ids.append(job_id)
             self._job_sub_task_log_dirs[job_id] = [get_log_file_dir(sub_task) for sub_task in sub_tasks]
